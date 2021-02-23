@@ -289,6 +289,11 @@ type Client struct {
 	// By default will not waiting, return ErrNoFreeConns immediately
 	MaxConnWaitTimeout time.Duration
 
+	// RetryIf controls whether a retry should be attempted after an error.
+	//
+	// By default will use isIdempotent function
+	RetryIf RetryIfFunc
+
 	mLock sync.Mutex
 	m     map[string]*HostClient
 	ms    map[string]*HostClient
@@ -446,6 +451,10 @@ func (c *Client) DoRedirects(req *Request, resp *Response, maxRedirectsCount int
 // and AcquireResponse in performance-critical code.
 func (c *Client) Do(req *Request, resp *Response) error {
 	uri := req.URI()
+	if uri == nil {
+		return ErrorInvalidURI
+	}
+
 	host := uri.Host()
 
 	isTLS := false
@@ -493,6 +502,7 @@ func (c *Client) Do(req *Request, resp *Response) error {
 			DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
 			DisablePathNormalizing:        c.DisablePathNormalizing,
 			MaxConnWaitTimeout:            c.MaxConnWaitTimeout,
+			RetryIf:                       c.RetryIf,
 		}
 		m[string(host)] = hc
 		if len(m) == 1 {
@@ -502,27 +512,42 @@ func (c *Client) Do(req *Request, resp *Response) error {
 	c.mLock.Unlock()
 
 	if startCleaner {
-		go c.mCleaner(m)
+		go c.mCleaner()
 	}
 
 	return hc.Do(req, resp)
 }
 
-func (c *Client) mCleaner(m map[string]*HostClient) {
+// CloseIdleConnections closes any connections which were previously
+// connected from previous requests but are now sitting idle in a
+// "keep-alive" state. It does not interrupt any connections currently
+// in use.
+func (c *Client) CloseIdleConnections() {
+	c.mLock.Lock()
+	for _, v := range c.m {
+		v.CloseIdleConnections()
+	}
+	for _, v := range c.ms {
+		v.CloseIdleConnections()
+	}
+	c.mLock.Unlock()
+}
+
+func (c *Client) mCleaner() {
 	mustStop := false
 
 	for {
 		c.mLock.Lock()
-		for k, v := range m {
+		for k, v := range c.m {
 			v.connsLock.Lock()
 			shouldRemove := v.connsCount == 0
 			v.connsLock.Unlock()
 
 			if shouldRemove {
-				delete(m, k)
+				delete(c.m, k)
 			}
 		}
-		if len(m) == 0 {
+		if len(c.m) == 0 {
 			mustStop = true
 		}
 		c.mLock.Unlock()
@@ -559,6 +584,11 @@ const DefaultMaxIdemponentCallAttempts = 5
 //   - foobar.com:443
 //   - foobar.com:8080
 type DialFunc func(addr string) (net.Conn, error)
+
+// RetryIfFunc signature of retry if function
+//
+// Request argument passed to RetryIfFunc, if there are any request errors.
+type RetryIfFunc func(request *Request) bool
 
 // HostClient balances http requests among hosts listed in Addr.
 //
@@ -698,6 +728,11 @@ type HostClient struct {
 	// By default will not waiting, return ErrNoFreeConns immediately
 	MaxConnWaitTimeout time.Duration
 
+	// RetryIf controls whether a retry should be attempted after an error.
+	//
+	// By default will use isIdempotent function
+	RetryIf RetryIfFunc
+
 	clientName  atomic.Value
 	lastUseTime uint32
 
@@ -821,8 +856,6 @@ func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDo
 	}
 	ch = chv.(chan clientURLResponse)
 
-	req := AcquireRequest()
-
 	// Note that the request continues execution on ErrTimeout until
 	// client-specific ReadTimeout exceeds. This helps limiting load
 	// on slow hosts by MaxConns* concurrent requests.
@@ -830,28 +863,55 @@ func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDo
 	// Without this 'hack' the load on slow host could exceed MaxConns*
 	// concurrent requests, since timed out requests on client side
 	// usually continue execution on the host.
+
+	var mu sync.Mutex
+	var timedout, responded bool
+
 	go func() {
+		req := AcquireRequest()
+
 		statusCodeCopy, bodyCopy, errCopy := doRequestFollowRedirectsBuffer(req, dst, url, c)
-		ch <- clientURLResponse{
-			statusCode: statusCodeCopy,
-			body:       bodyCopy,
-			err:        errCopy,
+		mu.Lock()
+		{
+			if !timedout {
+				ch <- clientURLResponse{
+					statusCode: statusCodeCopy,
+					body:       bodyCopy,
+					err:        errCopy,
+				}
+				responded = true
+			}
 		}
+		mu.Unlock()
+
+		ReleaseRequest(req)
 	}()
 
 	tc := AcquireTimer(timeout)
 	select {
 	case resp := <-ch:
-		ReleaseRequest(req)
-		clientURLResponseChPool.Put(chv)
 		statusCode = resp.statusCode
 		body = resp.body
 		err = resp.err
 	case <-tc.C:
-		body = dst
-		err = ErrTimeout
+		mu.Lock()
+		{
+			if responded {
+				resp := <-ch
+				statusCode = resp.statusCode
+				body = resp.body
+				err = resp.err
+			} else {
+				timedout = true
+				err = ErrTimeout
+				body = dst
+			}
+		}
+		mu.Unlock()
 	}
 	ReleaseTimer(tc)
+
+	clientURLResponseChPool.Put(chv)
 
 	return statusCode, body, err
 }
@@ -881,6 +941,9 @@ var (
 	// ErrTooManyRedirects is returned by clients when the number of redirects followed
 	// exceed the max count.
 	ErrTooManyRedirects = errors.New("too many redirects detected when doing the request")
+
+	// HostClients are only able to follow redirects to the same protocol.
+	ErrHostClientRedirectToDifferentScheme = errors.New("HostClient can't follow redirects to a different protocol, please use Client instead")
 )
 
 const defaultMaxRedirectsCount = 16
@@ -892,7 +955,7 @@ func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c clie
 	oldBody := bodyBuf.B
 	bodyBuf.B = dst
 
-	statusCode, body, err = doRequestFollowRedirects(req, resp, url, defaultMaxRedirectsCount, c)
+	statusCode, _, err = doRequestFollowRedirects(req, resp, url, defaultMaxRedirectsCount, c)
 
 	body = bodyBuf.B
 	bodyBuf.B = oldBody
@@ -903,27 +966,13 @@ func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c clie
 }
 
 func doRequestFollowRedirects(req *Request, resp *Response, url string, maxRedirectsCount int, c clientDoer) (statusCode int, body []byte, err error) {
-	scheme := req.uri.Scheme()
-	req.schemaUpdate = false
 	redirectsCount := 0
 
 	for {
-		// In case redirect to different scheme
-		if redirectsCount > 0 && !bytes.Equal(scheme, req.uri.Scheme()) {
-			if strings.HasPrefix(url, string(strHTTPS)) {
-				req.isTLS = true
-				req.uri.SetSchemeBytes(strHTTPS)
-			} else {
-				req.isTLS = false
-				req.uri.SetSchemeBytes(strHTTP)
-			}
-			scheme = req.uri.Scheme()
-			req.schemaUpdate = true
-		}
-
-		req.parsedURI = false
-		req.Header.host = req.Header.host[:0]
 		req.SetRequestURI(url)
+		if err := req.parseURI(); err != nil {
+			return 0, nil, err
+		}
 
 		if err = c.Do(req, resp); err != nil {
 			break
@@ -1128,7 +1177,7 @@ func clientDoDeadline(req *Request, resp *Response, deadline time.Time, c client
 	// usually continue execution on the host.
 
 	var mu sync.Mutex
-	var timedout bool
+	var timedout, responded bool
 
 	go func() {
 		reqCopy.timeout = timeout
@@ -1142,6 +1191,7 @@ func clientDoDeadline(req *Request, resp *Response, deadline time.Time, c client
 				}
 				swapRequestBody(reqCopy, req)
 				ch <- errDo
+				responded = true
 			}
 		}
 		mu.Unlock()
@@ -1157,17 +1207,17 @@ func clientDoDeadline(req *Request, resp *Response, deadline time.Time, c client
 	case <-tc.C:
 		mu.Lock()
 		{
-			timedout = true
-			err = ErrTimeout
+			if responded {
+				err = <-ch
+			} else {
+				timedout = true
+				err = ErrTimeout
+			}
 		}
 		mu.Unlock()
 	}
 	ReleaseTimer(tc)
 
-	select {
-	case <-ch:
-	default:
-	}
 	errorChPool.Put(chv)
 
 	return err
@@ -1196,6 +1246,10 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	if maxAttempts <= 0 {
 		maxAttempts = DefaultMaxIdemponentCallAttempts
 	}
+	isRequestRetryable := isIdempotent
+	if c.RetryIf != nil {
+		isRequestRetryable = c.RetryIf
+	}
 	attempts := 0
 	hasBodyStream := req.IsBodyStream()
 
@@ -1209,7 +1263,7 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		if hasBodyStream {
 			break
 		}
-		if !isIdempotent(req) {
+		if !isRequestRetryable(req) {
 			// Retry non-idempotent requests if the server closes
 			// the connection before sending the response.
 			//
@@ -1271,6 +1325,10 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 		panic("BUG: resp cannot be nil")
 	}
 
+	if c.IsTLS != bytes.Equal(req.uri.Scheme(), strHTTPS) {
+		return false, ErrHostClientRedirectToDifferentScheme
+	}
+
 	atomic.StoreUint32(&c.lastUseTime, uint32(time.Now().Unix()-startTimeUnix))
 
 	// Free up resources occupied by response before sending the request,
@@ -1285,17 +1343,7 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 		req.URI().DisablePathNormalizing = true
 	}
 
-	// If we detected a redirect to another schema
-	if req.schemaUpdate {
-		c.IsTLS = bytes.Equal(req.URI().Scheme(), strHTTPS)
-		c.Addr = addMissingPort(string(req.Host()), c.IsTLS)
-		c.addrIdx = 0
-		c.addrs = nil
-		req.schemaUpdate = false
-		req.SetConnectionClose()
-	}
-
-	cc, err := c.acquireConn(req.timeout)
+	cc, err := c.acquireConn(req.timeout, req.ConnectionClose())
 	if err != nil {
 		return false, err
 	}
@@ -1321,7 +1369,7 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 
 	userAgentOld := req.Header.UserAgent()
 	if len(userAgentOld) == 0 {
-		req.Header.userAgent = c.getClientName()
+		req.Header.userAgent = append(req.Header.userAgent[:0], c.getClientName()...)
 	}
 	bw := c.acquireWriter(conn)
 	err = req.Write(bw)
@@ -1350,7 +1398,7 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 		}
 	}
 
-	if customSkipBody || !req.Header.IsGet() && req.Header.IsHead() {
+	if customSkipBody || req.Header.IsHead() {
 		resp.SkipBody = true
 	}
 	if c.DisableHeaderNamesNormalizing {
@@ -1422,7 +1470,7 @@ func (c *HostClient) SetMaxConns(newMaxConns int) {
 	c.connsLock.Unlock()
 }
 
-func (c *HostClient) acquireConn(reqTimeout time.Duration) (cc *clientConn, err error) {
+func (c *HostClient) acquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
 	createConn := false
 	startCleaner := false
 
@@ -1437,7 +1485,7 @@ func (c *HostClient) acquireConn(reqTimeout time.Duration) (cc *clientConn, err 
 		if c.connsCount < maxConns {
 			c.connsCount++
 			createConn = true
-			if !c.connsCleanerRun {
+			if !c.connsCleanerRun && !connectionClose {
 				startCleaner = true
 				c.connsCleanerRun = true
 			}
@@ -1467,8 +1515,8 @@ func (c *HostClient) acquireConn(reqTimeout time.Duration) (cc *clientConn, err 
 		timeoutOverridden := false
 		// reqTimeout == 0 means not set
 		if reqTimeout > 0 && reqTimeout < timeout {
-				timeout = reqTimeout
-				timeoutOverridden = true
+			timeout = reqTimeout
+			timeoutOverridden = true
 		}
 
 		// wait for a free connection
@@ -1535,6 +1583,24 @@ func (c *HostClient) dialConnFor(w *wantConn) {
 	if !delivered {
 		// not delivered, return idle connection
 		c.releaseConn(cc)
+	}
+}
+
+// CloseIdleConnections closes any connections which were previously
+// connected from previous requests but are now sitting idle in a
+// "keep-alive" state. It does not interrupt any connections currently
+// in use.
+func (c *HostClient) CloseIdleConnections() {
+	c.connsLock.Lock()
+	scratch := append([]*clientConn{}, c.conns...)
+	for i := range c.conns {
+		c.conns[i] = nil
+	}
+	c.conns = c.conns[:0]
+	c.connsLock.Unlock()
+
+	for _, cc := range scratch {
+		c.closeConn(cc)
 	}
 }
 
@@ -1860,7 +1926,8 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 	if conn == nil {
 		panic("BUG: DialFunc returned (nil, nil)")
 	}
-	if isTLS {
+	_, isTLSAlready := conn.(*tls.Conn)
+	if isTLS && !isTLSAlready {
 		if timeout == 0 {
 			return tls.Client(conn, tlsConfig), nil
 		}
@@ -2381,20 +2448,28 @@ func (c *pipelineConnClient) init() {
 			c.chW = make(chan *pipelineWork, maxPendingRequests)
 		}
 		go func() {
-			if err := c.worker(); err != nil {
-				c.logger().Printf("error in PipelineClient(%q): %s", c.Addr, err)
-				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-					// Throttle client reconnections on temporary errors
-					time.Sleep(time.Second)
+			// Keep restarting the worker if it fails (connection errors for example).
+			for {
+				if err := c.worker(); err != nil {
+					c.logger().Printf("error in PipelineClient(%q): %s", c.Addr, err)
+					if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+						// Throttle client reconnections on temporary errors
+						time.Sleep(time.Second)
+					}
+				} else {
+					c.chLock.Lock()
+					stop := len(c.chR) == 0 && len(c.chW) == 0
+					if !stop {
+						c.chR = nil
+						c.chW = nil
+					}
+					c.chLock.Unlock()
+
+					if stop {
+						break
+					}
 				}
 			}
-
-			c.chLock.Lock()
-			// Do not reset c.chW to nil, since it may contain
-			// pending requests, which could be served on the next
-			// connection to the host.
-			c.chR = nil
-			c.chLock.Unlock()
 		}()
 	}
 	c.chLock.Unlock()
